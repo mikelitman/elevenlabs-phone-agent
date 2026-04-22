@@ -10,7 +10,7 @@ Built and battle-tested across four live projects:
 - **[Queue Index](https://queue-index.netlify.app)** — calls restaurants for live walk-in wait times
 - **[With Moshi](https://withmoshi.com)** — AI phone answering for UK restaurants
 
-13,000+ conversations logged. This is the exact stack.
+15,000+ conversations logged. This is the exact stack.
 
 ---
 
