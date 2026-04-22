@@ -1,0 +1,14 @@
+[
+  {
+    "id": "restaurant-abc-e1",
+    "name": "Restaurant ABC",
+    "phone": "020 7123 4567",
+    "cuisine": "Italian"
+  },
+  {
+    "id": "cafe-xyz-n1",
+    "name": "Cafe XYZ",
+    "phone": "07712 345678",
+    "cuisine": "Cafe"
+  }
+]

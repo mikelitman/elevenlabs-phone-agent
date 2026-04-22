@@ -1,0 +1,4 @@
+.env
+node_modules/
+data/transcripts/
+data/call-status.json

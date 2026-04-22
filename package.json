@@ -1,0 +1,15 @@
+{
+  "name": "elevenlabs-phone-agent",
+  "version": "1.0.0",
+  "description": "A Node.js server that connects Twilio and ElevenLabs to make outbound AI phone calls at scale.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "twilio": "^5.0.0",
+    "ws": "^8.16.0",
+    "express": "^4.18.0",
+    "dotenv": "^16.4.0"
+  }
+}
