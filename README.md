@@ -42,7 +42,7 @@ Two WebSocket connections run simultaneously: one to Twilio's media stream, one 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/mlitman2026/elevenlabs-phone-agent.git
+git clone https://github.com/mikelitman/elevenlabs-phone-agent.git
 cd elevenlabs-phone-agent
 npm install
 ```
