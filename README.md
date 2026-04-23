@@ -102,8 +102,11 @@ UK numbers are normalised automatically (`07...` → `+447...`).
 ### 7. Trigger a call batch
 
 ```bash
-curl -X POST "https://your-app.up.railway.app/trigger-calls?secret=your_trigger_secret&limit=5"
+curl -X POST "https://your-app.up.railway.app/trigger-calls?limit=5" \
+  -H "X-Trigger-Secret: your_trigger_secret"
 ```
+
+> **Security note:** pass the secret via the `X-Trigger-Secret` header, not a query parameter. Query params appear in Railway logs, Twilio call records, and any CDN access logs.
 
 Watch Railway logs. You should see the call connect, ElevenLabs join, conversation happen, and transcript save.
 
@@ -126,7 +129,8 @@ jobs:
       - name: Trigger calls
         run: |
           curl -f -X POST \
-            "${{ secrets.SERVER_URL }}/trigger-calls?secret=${{ secrets.TRIGGER_SECRET }}&limit=50"
+            "${{ secrets.SERVER_URL }}/trigger-calls?limit=50" \
+            -H "X-Trigger-Secret: ${{ secrets.TRIGGER_SECRET }}"
 ```
 
 ---

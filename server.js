@@ -6,14 +6,21 @@ import fs from "fs";
 import path from "path";
 import twilio from "twilio";
 
+const { VoiceResponse } = twilio.twiml;
+
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+
+// urlencoded must be global so Twilio webhook validation can read the body
 app.use(express.urlencoded({ extended: true }));
+// Default JSON limit for all routes; /trigger-calls gets a higher limit below
+app.use(express.json());
+
 const server = http.createServer(app);
 
 const activeCalls = new Map();
-const completedCalls = []; // In-memory fallback if filesystem resets
+const MAX_COMPLETED_CALLS = 200;
+const completedCalls = [];
 
 let currentRun = {
   active: false,
@@ -26,25 +33,48 @@ let currentRun = {
 // ── State helpers ─────────────────────────────────────────────────────────
 
 const STATUS_FILE = "data/call-status.json";
+let statusCache = null;
 
 function loadCallStatus() {
-  try { return JSON.parse(fs.readFileSync(STATUS_FILE, "utf-8")); } catch { return {}; }
+  if (statusCache) return statusCache;
+  try {
+    statusCache = JSON.parse(fs.readFileSync(STATUS_FILE, "utf-8"));
+  } catch {
+    statusCache = {};
+  }
+  return statusCache;
 }
 
-function saveCallStatus(statuses) {
-  fs.writeFileSync(STATUS_FILE, JSON.stringify(statuses, null, 2));
+// Mutates the in-memory cache synchronously; flushes to disk async
+function updateCallStatus(venueId, status, convId) {
+  if (!venueId) return;
+  loadCallStatus();
+  statusCache[venueId] = {
+    status,
+    callCount: (statusCache[venueId]?.callCount || 0) + 1,
+    lastCalled: new Date().toISOString(),
+    conversationId: convId || statusCache[venueId]?.conversationId,
+  };
+  fs.promises.writeFile(STATUS_FILE, JSON.stringify(statusCache, null, 2))
+    .catch(err => console.error(`[Status] Write failed: ${err.message}`));
+  if (status === "answered") currentRun.results.answered++;
+  else if (status === "no_answer") currentRun.results.no_answer++;
 }
 
-// ── Health check ──────────────────────────────────────────────────────────
+// ── Twilio webhook validation ─────────────────────────────────────────────
+// Validates X-Twilio-Signature on inbound webhooks. Skipped in dev when
+// TWILIO_AUTH_TOKEN is absent (e.g. local testing without a tunnel).
 
-app.get("/", (req, res) => {
-  res.json({ status: "running", activeCalls: activeCalls.size, run: currentRun });
-});
+const validateTwilio = process.env.TWILIO_AUTH_TOKEN
+  ? twilio.webhook(process.env.TWILIO_AUTH_TOKEN)
+  : (req, res, next) => next();
 
 // ── Auth helper ───────────────────────────────────────────────────────────
+// Prefer X-Trigger-Secret header over query/body param (query params appear
+// in Twilio's call logs, Railway logs, and any CDN access logs).
 
 function requireSecret(req, res) {
-  const secret = req.query.secret || req.body?.secret;
+  const secret = req.headers["x-trigger-secret"] || req.query.secret || req.body?.secret;
   if (secret !== process.env.TRIGGER_SECRET) {
     res.status(401).json({ error: "Unauthorized" });
     return false;
@@ -52,17 +82,52 @@ function requireSecret(req, res) {
   return true;
 }
 
+// ── Phone normalisation ───────────────────────────────────────────────────
+
+function normaliseUKPhone(phone) {
+  phone = phone.replace(/\s+/g, "");
+  if (phone.startsWith("0")) return "+44" + phone.slice(1);
+  if (!phone.startsWith("+")) return "+44" + phone;
+  return phone;
+}
+
+// ── Request logging ───────────────────────────────────────────────────────
+
+app.use((req, res, next) => {
+  console.log(`[HTTP] ${req.method} ${req.path}`);
+  next();
+});
+
+// ── Health check ──────────────────────────────────────────────────────────
+
+app.get("/", (req, res) => {
+  res.json({ status: "running", activeCalls: activeCalls.size, run: currentRun });
+});
+
 // ── Trigger a batch of calls ──────────────────────────────────────────────
 
-app.post("/trigger-calls", async (req, res) => {
+const ALLOWED_VENUE_FILES = new Set(["venues-example", "venues", "venues-buggy-smart"]);
+
+app.post("/trigger-calls", express.json({ limit: "10mb" }), async (req, res) => {
   if (!requireSecret(req, res)) return;
 
   if (currentRun.active) {
     return res.status(409).json({ error: "A run is already active", run: currentRun });
   }
 
-  const venueFile = (req.query.file || "venues-example").replace(/[^a-z0-9-]/gi, "");
-  const venues = JSON.parse(fs.readFileSync(`data/${venueFile}.json`, "utf-8"));
+  const venueFile = req.query.file || "venues-example";
+  if (!ALLOWED_VENUE_FILES.has(venueFile)) {
+    return res.status(400).json({ error: "Invalid venue file" });
+  }
+
+  let venues;
+  try {
+    const content = await fs.promises.readFile(`data/${venueFile}.json`, "utf-8");
+    venues = JSON.parse(content);
+  } catch {
+    return res.status(400).json({ error: "Venue file not found or invalid" });
+  }
+
   const statuses = loadCallStatus();
 
   const callable = venues.filter(v => {
@@ -93,11 +158,7 @@ app.post("/trigger-calls", async (req, res) => {
 
   for (let i = 0; i < callable.length; i++) {
     const venue = callable[i];
-
-    // Normalise UK numbers: 07... -> +447..., 020... -> +4420...
-    let phone = venue.phone.replace(/\s+/g, "");
-    if (phone.startsWith("0")) phone = "+44" + phone.slice(1);
-    if (!phone.startsWith("+")) phone = "+44" + phone;
+    const phone = normaliseUKPhone(venue.phone);
 
     try {
       const twimlUrl = new URL(`${SERVER_URL}/outbound-twiml`);
@@ -133,9 +194,8 @@ app.post("/trigger-calls", async (req, res) => {
   await new Promise(r => setTimeout(r, 60_000));
 
   // Auto-retry venues that didn't answer (once, after 5 minutes)
-  const afterStatuses = loadCallStatus();
   const toRetry = callable.filter(v => {
-    const s = afterStatuses[v.id];
+    const s = statusCache?.[v.id];
     return s && s.status === "no_answer" && (s.callCount || 0) <= 1;
   });
 
@@ -144,9 +204,7 @@ app.post("/trigger-calls", async (req, res) => {
     await new Promise(r => setTimeout(r, 300_000));
 
     for (const venue of toRetry) {
-      let phone = venue.phone.replace(/\s+/g, "");
-      if (phone.startsWith("0")) phone = "+44" + phone.slice(1);
-
+      const phone = normaliseUKPhone(venue.phone);
       const twimlUrl = new URL(`${SERVER_URL}/outbound-twiml`);
       twimlUrl.searchParams.set("venueName", venue.name);
       twimlUrl.searchParams.set("venueId", venue.id);
@@ -177,42 +235,60 @@ app.post("/trigger-calls", async (req, res) => {
 
 // ── TwiML: tells Twilio to open a media stream to this server ─────────────
 
-app.all("/outbound-twiml", (req, res) => {
+app.all("/outbound-twiml", validateTwilio, (req, res) => {
   const { venueName = "", venueId = "", cuisine = "" } = req.query;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host}/media-stream">
-      <Parameter name="venueName" value="${venueName}" />
-      <Parameter name="venueId" value="${venueId}" />
-      <Parameter name="cuisine" value="${cuisine}" />
-    </Stream>
-  </Connect>
-</Response>`;
+  const serverWsUrl = new URL(process.env.SERVER_URL);
+  serverWsUrl.protocol = serverWsUrl.protocol === "https:" ? "wss:" : "ws:";
+  serverWsUrl.pathname = "/media-stream";
 
-  res.type("text/xml").send(twiml);
+  const twiml = new VoiceResponse();
+  const connect = twiml.connect();
+  const stream = connect.stream({ url: serverWsUrl.toString() });
+  stream.parameter({ name: "venueName", value: venueName });
+  stream.parameter({ name: "venueId", value: venueId });
+  stream.parameter({ name: "cuisine", value: cuisine });
+
+  res.type("text/xml").send(twiml.toString());
 });
 
 // ── Call status webhook ───────────────────────────────────────────────────
 
-app.post("/call-status", (req, res) => {
-  console.log(`[Status] ${req.body.CallSid}: ${req.body.CallStatus} (${req.body.CallDuration}s)`);
+app.post("/call-status", validateTwilio, (req, res) => {
+  const { CallSid, CallStatus, CallDuration } = req.body;
+  console.log(`[Status] ${CallSid}: ${CallStatus} (${CallDuration}s)`);
   res.sendStatus(200);
 });
 
 // ── Transcripts endpoint ──────────────────────────────────────────────────
 
-app.get("/transcripts", (req, res) => {
+app.get("/transcripts", async (req, res) => {
   if (!requireSecret(req, res)) return;
 
+  const page = Math.max(1, parseInt(req.query.page || "1"));
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || "50")));
   const dir = "data/transcripts";
+
   try {
-    const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
-    const transcripts = files.map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8")); } catch { return null; }
-    }).filter(Boolean);
-    res.json({ count: transcripts.length, transcripts });
+    const allFiles = (await fs.promises.readdir(dir)).filter(f => f.endsWith(".json"));
+    const total = allFiles.length;
+    const pageFiles = allFiles
+      .sort()
+      .reverse()
+      .slice((page - 1) * limit, page * limit);
+
+    const transcripts = (await Promise.all(
+      pageFiles.map(async f => {
+        try {
+          const content = await fs.promises.readFile(path.join(dir, f), "utf-8");
+          return JSON.parse(content);
+        } catch {
+          return null;
+        }
+      })
+    )).filter(Boolean);
+
+    res.json({ total, page, limit, count: transcripts.length, transcripts });
   } catch {
     res.json({ count: completedCalls.length, transcripts: completedCalls, source: "in-memory" });
   }
@@ -221,6 +297,8 @@ app.get("/transcripts", (req, res) => {
 // ── WebSocket bridge: Twilio <-> ElevenLabs ───────────────────────────────
 
 const wss = new WebSocketServer({ server, path: "/media-stream" });
+
+const MAX_QUEUED_AUDIO_FRAMES = 400; // ~3.5 seconds of audio at 8kHz mulaw
 
 wss.on("connection", (twilioWs) => {
   let streamSid = null;
@@ -244,26 +322,16 @@ wss.on("connection", (twilioWs) => {
     }
   }, 120_000);
 
-  function updateCallStatus(venueId, status, convId) {
-    if (!venueId) return;
-    const statuses = loadCallStatus();
-    statuses[venueId] = {
-      status,
-      callCount: (statuses[venueId]?.callCount || 0) + 1,
-      lastCalled: new Date().toISOString(),
-      conversationId: convId || statuses[venueId]?.conversationId,
-    };
-    saveCallStatus(statuses);
-    if (status === "answered") currentRun.results.answered++;
-    else currentRun.results.no_answer++;
-  }
-
   async function getSignedUrl() {
-    const res = await fetch(
+    const response = await fetch(
       `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${process.env.ELEVENLABS_AGENT_ID}`,
       { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
     );
-    const data = await res.json();
+    if (!response.ok) {
+      throw new Error(`ElevenLabs signed URL failed: ${response.status} ${response.statusText}`);
+    }
+    const data = await response.json();
+    if (!data.signed_url) throw new Error("ElevenLabs: no signed_url in response");
     return data.signed_url;
   }
 
@@ -274,8 +342,8 @@ wss.on("connection", (twilioWs) => {
     elevenLabsWs.on("open", () => {
       console.log(`[ElevenLabs] Connected — ${customParams?.venueName}`);
 
-      // Pass per-call context to the agent
-      // These fill {{variable_name}} placeholders in your ElevenLabs agent prompt
+      // Pass per-call context to the agent.
+      // These fill {{variable_name}} placeholders in your ElevenLabs agent prompt.
       elevenLabsWs.send(JSON.stringify({
         type: "conversation_initiation_client_data",
         dynamic_variables: {
@@ -374,6 +442,9 @@ wss.on("connection", (twilioWs) => {
           }
           break;
         }
+
+        default:
+          console.log(`[ElevenLabs] Unknown message type: ${msg.type}`);
       }
     });
 
@@ -405,25 +476,29 @@ wss.on("connection", (twilioWs) => {
     if (conversationId) {
       await new Promise(r => setTimeout(r, 3000));
       try {
-        const res = await fetch(
+        const response = await fetch(
           `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
           { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
         );
-        const fullData = await res.json();
-        result.elevenLabsTranscript = fullData.transcript;
-        result.callDuration = fullData.metadata?.call_duration_secs;
-        result.analysis = fullData.analysis;
+        if (response.ok) {
+          const fullData = await response.json();
+          result.elevenLabsTranscript = fullData.transcript;
+          result.callDuration = fullData.metadata?.call_duration_secs;
+          result.analysis = fullData.analysis;
+        }
       } catch (err) {
         console.error(`[API] Transcript fetch failed: ${err.message}`);
       }
     }
 
-    fs.mkdirSync("data/transcripts", { recursive: true });
+    await fs.promises.mkdir("data/transcripts", { recursive: true });
     const filename = `data/transcripts/${result.venueId || "unknown"}_${Date.now()}.json`;
-    fs.writeFileSync(filename, JSON.stringify(result, null, 2));
+    await fs.promises.writeFile(filename, JSON.stringify(result, null, 2));
     console.log(`[Saved] ${filename}`);
 
     completedCalls.push(result);
+    if (completedCalls.length > MAX_COMPLETED_CALLS) completedCalls.shift();
+
     updateCallStatus(result.venueId, gotHumanResponse ? "answered" : "no_answer", conversationId);
     activeCalls.delete(callSid);
   }
@@ -441,7 +516,11 @@ wss.on("connection", (twilioWs) => {
         customParams = msg.start.customParameters;
         console.log(`[Twilio] Call started — ${customParams?.venueName} (${callSid})`);
         activeCalls.set(callSid, { venueName: customParams?.venueName });
-        connectElevenLabs();
+        connectElevenLabs().catch(err => {
+          console.error(`[ElevenLabs] Failed to connect: ${err.message}`);
+          updateCallStatus(customParams?.venueId, "no_answer", null);
+          twilioWs.close();
+        });
         break;
 
       case "media":
@@ -449,13 +528,16 @@ wss.on("connection", (twilioWs) => {
           elevenLabsWs.send(JSON.stringify({ user_audio_chunk: msg.media.payload }));
         } else {
           // Buffer audio while ElevenLabs connects (~1 second)
-          if (audioQueue.length < 400) audioQueue.push(msg.media.payload);
+          if (audioQueue.length < MAX_QUEUED_AUDIO_FRAMES) audioQueue.push(msg.media.payload);
         }
         break;
 
       case "stop":
         if (elevenLabsWs?.readyState === WebSocket.OPEN) elevenLabsWs.close();
         break;
+
+      default:
+        console.log(`[Twilio] Unknown event: ${msg.event}`);
     }
   });
 
