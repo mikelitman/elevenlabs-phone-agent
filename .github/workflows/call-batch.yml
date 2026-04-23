@@ -1,0 +1,17 @@
+name: Call batch
+
+on:
+  schedule:
+    - cron: "45 9 * * 1-5"   # 10:45am BST (Mon-Fri)
+    - cron: "45 13 * * 1-5"  # 2:45pm BST
+  workflow_dispatch:           # run manually from GitHub Actions tab
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger calls
+        run: |
+          curl -f -X POST \
+            "${{ secrets.SERVER_URL }}/trigger-calls?limit=50" \
+            -H "X-Trigger-Secret: ${{ secrets.TRIGGER_SECRET }}"
